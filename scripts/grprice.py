@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -53,8 +55,28 @@ PLUS_FREE_OVER = {"address": float(os.environ.get("GRPRICE_PLUS_ADDRESS_MIN", "2
                   "point": float(os.environ.get("GRPRICE_PLUS_POINT_MIN", "15"))}
 DELIVERY_MODE = os.environ.get("GRPRICE_DELIVERY", "address")
 
-MIN_INTERVAL = {"www.skroutz.gr": 4.0, "www.bestprice.gr": 1.0}
+# Politeness budget: the minimum gap between two requests to the same host.
+# This is a *rate*, not a concurrency limit -- overlapping slow requests is fine,
+# issuing them faster is not, so _pace() serialises the moment of issue while
+# leaving the waiting-around to overlap. Measured: a Skroutz page render is
+# ~0.9s, so at 4s the old setting spent ~70% of a run asleep on purpose.
+MIN_INTERVAL = {"www.skroutz.gr": 1.0, "www.bestprice.gr": 1.0}
 DEFAULT_INTERVAL = 2.0
+_pace_lock = threading.Lock()
+
+
+def _pace(host: str) -> None:
+    """Block until this host may be hit again. Safe to call from any thread."""
+    gap = MIN_INTERVAL.get(host, DEFAULT_INTERVAL)
+    while True:
+        with _pace_lock:
+            now = time.monotonic()
+            wait = gap - (now - _last_request.get(host, -1e9))
+            if wait <= 0:
+                # Claim the slot inside the lock so two threads cannot both pass.
+                _last_request[host] = now
+                return
+        time.sleep(wait)
 
 _last_request: dict[str, float] = {}
 # Hosts that answered with a bot-management challenge during this run. A
@@ -236,10 +258,8 @@ def _http_get(url: str, host: str, xhr: bool) -> str:
         try:
             with urllib.request.urlopen(req, timeout=25) as resp:
                 body = resp.read().decode("utf-8", "replace")
-            _last_request[host] = time.time()
             return body
         except urllib.error.HTTPError as e:
-            _last_request[host] = time.time()
             try:
                 err_body = e.read().decode("utf-8", "replace")
             except Exception:
@@ -264,8 +284,16 @@ def _http_get(url: str, host: str, xhr: bool) -> str:
     raise RuntimeError(f"failed to fetch {url}: {last_err}")
 
 
-def fetch(url: str, ttl: int = CACHE_TTL, xhr: bool = False) -> str:
-    """GET a URL with on-disk caching, rate limiting, and transport dispatch."""
+def fetch(url: str, ttl: int | None = None, xhr: bool = False) -> str:
+    """GET a URL with on-disk caching, rate limiting, and transport dispatch.
+
+    `ttl` resolves at call time, not import time. It used to default to
+    `CACHE_TTL` in the signature, which bound the value once at def time -- so
+    --no-cache set the global, every caller kept the 900s default, and prices
+    went stale exactly when someone asked for fresh ones.
+    """
+    if ttl is None:
+        ttl = CACHE_TTL
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha256(url.encode()).hexdigest()[:20]
     path = CACHE_DIR / f"{key}.html"
@@ -278,14 +306,10 @@ def fetch(url: str, ttl: int = CACHE_TTL, xhr: bool = False) -> str:
         # Already refused this run; going back changes nothing but the clock.
         raise BlockedError(host, _blocked_hosts[host])
 
-    gap = MIN_INTERVAL.get(host, DEFAULT_INTERVAL)
-    wait = gap - (time.time() - _last_request.get(host, 0.0))
-    if wait > 0:
-        time.sleep(wait)
+    _pace(host)
 
     if USE_BROWSER and host in BROWSER_HOSTS:
         body = _browser_get(url)
-        _last_request[host] = time.time()
     else:
         body = _http_get(url, host, xhr)
 
@@ -736,6 +760,83 @@ def _detail_id(url: str) -> str:
     return re.sub(r"\W+", "", (url or "x"))[-12:] or "x"
 
 
+_state_lock = threading.Lock()
+
+
+class _Seq:
+    """Thread-safe file numbering, so both legs can write raw/ at once."""
+
+    def __init__(self):
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> int:
+        with self._lock:
+            self._n += 1
+            return self._n
+
+
+def _gather_leg(name: str, query: str, limit: int, max_price: float | None,
+                raw, seq: "_Seq", workers: int = 1) -> tuple[list, list, int, int]:
+    """Search one site and detail every hit it returned.
+
+    Returns (fetch_records, candidates, failed, price_filtered_out). Runs
+    entirely within one thread so the two sites can proceed independently --
+    one site being slow no longer holds the other up.
+    """
+    t0 = time.time()
+    rows = _search_source(name, query, limit)
+    with _state_lock:
+        status = next((d for d in source_report() if d["source"] == name), {})
+    fetches = [{
+        "file": _write_raw(raw, seq.next(), f"search-{name}",
+                           {"query": query, "source": name, "rows": rows}),
+        "kind": "search", "target": name,
+        "status": "ok" if status.get("state") == "ok" else status.get("state"),
+        "rows": len(rows), "seconds": round(time.time() - t0, 1),
+        "error": status.get("detail"),
+    }]
+
+    dropped = 0
+    if max_price is not None:
+        before = len(rows)
+        rows = [h for h in rows
+                if h.get("price_from") is None or h["price_from"] <= max_price]
+        dropped = before - len(rows)
+
+    def one(h):
+        t = time.time()
+        err = None
+        try:
+            d = offers(h["url"])
+            d.setdefault("name", h.get("name"))
+        except Exception as e:
+            err = str(e)
+            d = dict(h)
+            d["detail_error"] = err
+            d.setdefault("offers", [])
+        rec = {
+            "file": _write_raw(raw, seq.next(),
+                               f"detail-{h.get('source')}-{_detail_id(h.get('url'))}", d),
+            "kind": "detail", "target": h.get("url"),
+            "status": "failed" if err else "ok",
+            "seconds": round(time.time() - t, 1), "error": err,
+        }
+        return rec, d, (1 if err else 0)
+
+    if workers > 1 and len(rows) > 1:
+        # Overlap latency only. _pace() still gates the moment of issue, so the
+        # request *rate* is unchanged -- these workers spend their time waiting
+        # on responses, not queue-jumping the politeness budget.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(one, rows))
+    else:
+        results = [one(h) for h in rows]
+
+    fetches += [r[0] for r in results]
+    return fetches, [r[1] for r in results], sum(r[2] for r in results), dropped
+
+
 def gather(query: str, source: str = "both", limit: int = 16,
            max_price: float | None = None, runs_dir=None) -> dict:
     """Fetch everything, decide nothing.
@@ -760,54 +861,40 @@ def gather(query: str, source: str = "both", limit: int = 16,
     raw = run / "raw"
     raw.mkdir(parents=True, exist_ok=True)
 
-    fetches, hits, seq = [], [], 0
-    for name in ("skroutz", "bestprice"):
-        if source not in (name, "both"):
-            continue
-        seq += 1
-        t0 = time.time()
-        rows = _search_source(name, query, limit)
-        status = next((d for d in source_report() if d["source"] == name), {})
-        fetches.append({
-            "file": _write_raw(raw, seq, f"search-{name}",
-                               {"query": query, "source": name, "rows": rows}),
-            "kind": "search", "target": name,
-            "status": "ok" if status.get("state") == "ok" else status.get("state"),
-            "rows": len(rows), "seconds": round(time.time() - t0, 1),
-            "error": status.get("detail"),
-        })
-        hits.extend(rows)
-    record_history(hits)
+    seq = _Seq()
+    legs: dict[str, tuple] = {}
 
-    dropped = 0
-    if max_price is not None:
-        before = len(hits)
-        hits = [h for h in hits
-                if h.get("price_from") is None or h["price_from"] <= max_price]
-        dropped = before - len(hits)
-
-    candidates, failed = [], 0
-    for h in hits:
-        seq += 1
-        t0 = time.time()
-        err = None
+    def run_leg(name, workers):
         try:
-            d = offers(h["url"])
-            d.setdefault("name", h.get("name"))
-        except Exception as e:
-            err = str(e)
-            failed += 1
-            d = dict(h)
-            d["detail_error"] = err
-            d.setdefault("offers", [])
-        fetches.append({
-            "file": _write_raw(raw, seq,
-                               f"detail-{h.get('source')}-{_detail_id(h.get('url'))}", d),
-            "kind": "detail", "target": h.get("url"),
-            "status": "failed" if err else "ok",
-            "seconds": round(time.time() - t0, 1), "error": err,
-        })
-        candidates.append(d)
+            legs[name] = _gather_leg(name, query, limit, max_price, raw, seq, workers)
+        except Exception as e:                      # a whole leg dying is survivable
+            _note_source(name, "error", str(e))
+            _warn(f"{name}: {e}")
+            legs[name] = ([], [], 0, 0)
+
+    want = [n for n in ("skroutz", "bestprice") if source in (n, "both")]
+    # BestPrice moves to a worker thread; Skroutz stays on this one because
+    # Playwright's sync API must be used from the thread that created it (and
+    # that is where atexit closes the browser). BestPrice is plain HTTP and
+    # latency-bound, so it also gets a small pool to overlap round-trips.
+    side = None
+    if "bestprice" in want:
+        side = threading.Thread(target=run_leg, args=("bestprice", 4), daemon=True)
+        side.start()
+    if "skroutz" in want:
+        run_leg("skroutz", 1)
+    if side:
+        side.join()
+
+    fetches, candidates, failed, dropped, hits = [], [], 0, 0, []
+    for name in want:                               # deterministic merge order
+        f, c, fail, drop = legs.get(name, ([], [], 0, 0))
+        fetches += f
+        candidates += c
+        failed += fail
+        dropped += drop
+        hits += c
+    record_history([h for h in hits if h.get("price_from") is not None])
 
     # Presentation order only. Nothing is dropped and nothing is preferred.
     candidates.sort(key=lambda c: (
@@ -819,7 +906,7 @@ def gather(query: str, source: str = "both", limit: int = 16,
         "gathered": time.strftime("%Y-%m-%d %H:%M"),
         "source": source, "limit": limit, "max_price": max_price,
         "price_filtered_out": dropped,
-        "hits": len(hits), "detailed": len(candidates), "failed": failed,
+        "hits": len(candidates), "detailed": len(candidates), "failed": failed,
         "sources": source_report(), "complete": sources_complete(),
         "skroutz_plus": SKROUTZ_PLUS, "browser": USE_BROWSER,
     }

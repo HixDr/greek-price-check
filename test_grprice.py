@@ -372,5 +372,202 @@ class GatherTests(unittest.TestCase):
             self.assertFalse(hasattr(grprice, gone),
                              f"{gone} should have been deleted")
 
+class CacheControlTests(unittest.TestCase):
+    """--no-cache must actually bypass the cache.
+
+    `fetch(url, ttl=CACHE_TTL)` bound its default at import time, so setting
+    the module global later (which is exactly what --no-cache does) left every
+    caller on the 900s default. Prices went stale precisely when someone asked
+    for fresh ones.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._orig_cache = grprice.CACHE_DIR
+        self._orig_ttl = grprice.CACHE_TTL
+        grprice.CACHE_DIR = Path(self._tmp.name)
+        grprice._last_request.clear()
+        grprice._blocked_hosts.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        grprice.CACHE_DIR = self._orig_cache
+        grprice.CACHE_TTL = self._orig_ttl
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _resp(body=b"<html>x</html>"):
+        class OK:
+            def read(self_i): return body
+            def __enter__(self_i): return self_i
+            def __exit__(self_i, *a): return False
+        return OK
+
+    def test_setting_cache_ttl_to_zero_bypasses_the_cache(self):
+        grprice.CACHE_TTL = 0
+        calls = []
+
+        def once(*a, **k):
+            calls.append(1)
+            return self._resp()()
+
+        url = "https://www.bestprice.gr/search?q=x"
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=once):
+            with unittest.mock.patch("time.sleep"):
+                grprice.fetch(url)
+                grprice.fetch(url)
+        self.assertEqual(len(calls), 2,
+                         "second fetch served from cache despite CACHE_TTL = 0")
+
+    def test_default_ttl_still_caches(self):
+        grprice.CACHE_TTL = 900
+        calls = []
+
+        def once(*a, **k):
+            calls.append(1)
+            return self._resp()()
+
+        url = "https://www.bestprice.gr/search?q=y"
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=once):
+            with unittest.mock.patch("time.sleep"):
+                grprice.fetch(url)
+                grprice.fetch(url)
+        self.assertEqual(len(calls), 1, "cache should still work by default")
+
+class PacingTests(unittest.TestCase):
+    """Concurrency must hide latency without raising the request RATE.
+
+    The pause between requests is the politeness budget. Overlapping slow
+    requests is fine -- issuing them faster is not. These pin that distinction,
+    because "make it parallel" is exactly how a rate limit gets removed by
+    accident.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._orig_cache = grprice.CACHE_DIR
+        grprice.CACHE_DIR = Path(self._tmp.name)
+        grprice._last_request.clear()
+        grprice._blocked_hosts.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        grprice.CACHE_DIR = self._orig_cache
+        self._tmp.cleanup()
+
+    def test_skroutz_pause_is_one_second(self):
+        self.assertEqual(grprice.MIN_INTERVAL["www.skroutz.gr"], 1.0)
+
+    def test_pace_serialises_across_threads(self):
+        """Ten threads hitting one host must still issue at ~1/sec, not all at once."""
+        import threading
+        grprice.MIN_INTERVAL["test.example"] = 0.05
+        stamps = []
+        lock = threading.Lock()
+
+        def worker():
+            grprice._pace("test.example")
+            with lock:
+                stamps.append(time.monotonic())
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        stamps.sort()
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        self.assertEqual(len(stamps), 10)
+        too_fast = [g for g in gaps if g < 0.04]
+        self.assertFalse(too_fast,
+                         f"{len(too_fast)} requests issued faster than the pace: {gaps}")
+
+
+class ConcurrentGatherTests(unittest.TestCase):
+    """Running the two sites at once must not change what comes back."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_cache = grprice.CACHE_DIR
+        grprice.CACHE_DIR = self.root / "cache"
+        grprice._last_request.clear()
+        grprice._blocked_hosts.clear()
+        grprice._source_status.clear()
+        grprice._warned.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        grprice.CACHE_DIR = self._orig_cache
+        self._tmp.cleanup()
+
+    def test_concurrent_run_returns_every_candidate(self):
+        sk = [_hit("skroutz", i, 90 + i) for i in range(4)]
+        bp = [_hit("bestprice", i, 10 + i) for i in range(4)]
+
+        def slow_detail(url):
+            time.sleep(0.15)          # latency, the thing concurrency should hide
+            return _detail(next(h for h in sk + bp if h["url"] == url))
+
+        with unittest.mock.patch.object(grprice, "skroutz_search", return_value=list(sk)), \
+             unittest.mock.patch.object(grprice, "bestprice_search", return_value=list(bp)), \
+             unittest.mock.patch.object(grprice, "offers", side_effect=slow_detail):
+            res = grprice.gather("x", runs_dir=self.root / "runs")
+
+        report = (Path(res["run_dir"]) / "REPORT.txt").read_text()
+        self.assertEqual(res["detailed"], 8)
+        for h in sk + bp:
+            self.assertIn(h["name"], report)
+        # ordering must stay deterministic despite threads
+        order = [l.split()[-1] for l in report.splitlines()
+                 if l.startswith("source      ")]
+        self.assertEqual(order, sorted(order), "candidate order must stay stable")
+
+    def test_the_two_sites_actually_overlap(self):
+        """Guards against the 'parallel' code quietly running serially.
+
+        4 hits per source at 0.15s each is 1.2s if everything is sequential.
+        BestPrice pools its details and runs alongside Skroutz, so it should
+        land near the slowest single leg instead of the sum.
+        """
+        sk = [_hit("skroutz", i, 90 + i) for i in range(4)]
+        bp = [_hit("bestprice", i, 10 + i) for i in range(4)]
+
+        def slow(url):
+            time.sleep(0.15)
+            return _detail(next(h for h in sk + bp if h["url"] == url))
+
+        with unittest.mock.patch.object(grprice, "skroutz_search", return_value=list(sk)), \
+             unittest.mock.patch.object(grprice, "bestprice_search", return_value=list(bp)), \
+             unittest.mock.patch.object(grprice, "offers", side_effect=slow):
+            started = time.monotonic()
+            res = grprice.gather("x", runs_dir=self.root / "runs")
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(res["detailed"], 8)
+        self.assertLess(elapsed, 0.95,
+                        f"ran in {elapsed:.2f}s; 8 x 0.15s serial would be ~1.2s "
+                        "- the legs are not overlapping")
+
+    def test_failures_in_one_source_do_not_lose_the_other(self):
+        sk = [_hit("skroutz", i, 50 + i) for i in range(2)]
+        bp = [_hit("bestprice", i, 40 + i) for i in range(2)]
+
+        def flaky(url):
+            if "skroutz" in url:
+                raise RuntimeError("render died")
+            return _detail(next(h for h in bp if h["url"] == url))
+
+        with unittest.mock.patch.object(grprice, "skroutz_search", return_value=list(sk)), \
+             unittest.mock.patch.object(grprice, "bestprice_search", return_value=list(bp)), \
+             unittest.mock.patch.object(grprice, "offers", side_effect=flaky):
+            res = grprice.gather("x", runs_dir=self.root / "runs")
+        report = (Path(res["run_dir"]) / "REPORT.txt").read_text()
+        self.assertEqual(res["detailed"], 4)
+        self.assertEqual(res["failed"], 2)
+        self.assertIn("render died", report)
+        for h in bp:
+            self.assertIn(h["name"], report)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

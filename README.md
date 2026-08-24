@@ -68,9 +68,13 @@ runs/2026-08-24-wifi-camera/
 **`--limit` is what a run costs you.** Every hit gets a full detail fetch —
 Skroutz ~20s each through the browser, BestPrice ~2s. The default of 16 is
 chosen because BestPrice search pages top out at 16 results, so it captures that
-site completely; a measured run gave **32 candidates in 4m19s** (~130KB of
+site completely; a measured run gave **32 candidates in 1m55s** (~130KB of
 report). Raising it adds Skroutz only (~48 available there). Drop to
 `--limit 4` for a quick look.
+
+The two sites are fetched concurrently, and BestPrice details are pooled to
+overlap round-trips. Both sites are still rate-limited to one request per second
+each — the pool hides latency, it does not issue requests faster.
 
 ### Other commands
 

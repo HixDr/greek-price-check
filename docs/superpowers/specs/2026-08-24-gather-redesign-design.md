@@ -50,7 +50,7 @@ grprice.py gather "wifi camera εξωτερικου χωρου" --browser --plus
 `--limit` (default 16 per source) is the only cost dial, and it belongs to the
 user. 16 was chosen after measuring the search pages: BestPrice yields at most
 16 hits, Skroutz ~48 — so the default captures BestPrice completely and samples
-Skroutz. Measured: 32 candidates in 4m19s.
+Skroutz. Measured: 32 candidates in 1m55s.
 
 ### Why detail everything
 
@@ -60,8 +60,8 @@ selection decision back somewhere. Detailing every hit is the only option where
 no code chooses. Accepted costs, explicitly:
 
 - **Skroutz load roughly doubles** — every hit gets a browser render, including
-  ones Claude would have dismissed on sight. Pacing (4s) and the 15-minute
-  cache still apply. `--limit` is the mitigation.
+  ones Claude would have dismissed on sight. Pacing (1s per host) and the
+  15-minute cache still apply. `--limit` is the mitigation.
 - **~32k tokens per report** at the default (measured: 130KB). Deemed acceptable.
 
 ## Artifacts

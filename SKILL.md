@@ -37,7 +37,7 @@ It prints the report path. **Read that file**, then recommend.
 - `--plus` — this user has Skroutz Plus. Always pass it (see Shipping below).
 - `--limit N` (default 16) is hits per source, and the only cost dial: **every**
   hit gets a full detail fetch. Measured: the default yields 32 candidates in
-  ~4½ minutes. That breadth is what a confident recommendation needs — don't
+  ~2 minutes. That breadth is what a confident recommendation needs — don't
   lower it just to be quick. BestPrice search pages top out at 16, so raising it past the default
   only adds Skroutz results at ~20s each. Use `--limit 4` only when the user
   explicitly wants a fast answer or names one specific product.
