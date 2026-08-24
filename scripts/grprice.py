@@ -30,7 +30,9 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import glob
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -97,7 +99,10 @@ _blocked_hosts: dict[str, str] = {}
 # headed by default and warns if you force it off. Playwright is an optional
 # dependency, imported only when the browser transport is actually used; the
 # BestPrice path stays stdlib-only and much faster over plain HTTP.
-USE_BROWSER = os.environ.get("GRPRICE_BROWSER", "").lower() in ("1", "true", "yes")
+# On by default: Skroutz cannot be read without a browser, so making it a flag
+# only means the first run silently returns half the market. --no-browser opts
+# out for a fast BestPrice-only lookup.
+USE_BROWSER = os.environ.get("GRPRICE_BROWSER", "1").lower() not in ("0", "false", "no")
 BROWSER_HEADLESS = os.environ.get("GRPRICE_BROWSER_HEADLESS", "").lower() in ("1", "true", "yes")
 BROWSER_HOSTS = {"www.skroutz.gr"}
 BROWSER_PROFILE = CACHE_DIR / "browser-profile"
@@ -115,6 +120,53 @@ CDP_URL = os.environ.get("GRPRICE_CDP_URL", "")
 # Required" -- a hard block, not a solvable challenge -- so the window is real
 # but parked off-screen where nobody has to look at it.
 BROWSER_EXE = os.environ.get("GRPRICE_BROWSER_EXE", "")
+
+
+def _candidate_browsers() -> list[str]:
+    """Browsers we could drive, best first.
+
+    Brave and Chrome before Edge, and a Windows browser before a Linux one when
+    running under WSL: a Windows browser carries an ordinary desktop
+    fingerprint, which is the whole point of not letting Playwright download
+    and launch its own.
+    """
+    pats = [
+        "/mnt/*/Users/*/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe",
+        "/mnt/*/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe",
+        "/mnt/*/Users/*/AppData/Local/Google/Chrome/Application/chrome.exe",
+        "/mnt/*/Program Files/Google/Chrome/Application/chrome.exe",
+        "/mnt/*/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+        "/mnt/*/Program Files/Microsoft/Edge/Application/msedge.exe",
+    ]
+    out = []
+    for pat in pats:
+        out += sorted(glob.glob(pat))
+    out += ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    for name in ("brave-browser", "google-chrome", "google-chrome-stable",
+                 "chromium", "chromium-browser", "microsoft-edge"):
+        found = shutil.which(name)
+        if found:
+            out.append(found)
+    seen, uniq = set(), []
+    for c in out:
+        if c not in seen and os.path.exists(c):
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+_browser_exe_cache: list = []
+
+
+def find_browser() -> str | None:
+    """The browser to drive: an explicit setting, else whatever is installed."""
+    explicit = os.environ.get("GRPRICE_BROWSER_EXE") or BROWSER_EXE
+    if explicit:
+        return explicit
+    if not _browser_exe_cache:
+        _browser_exe_cache.append(next(iter(_candidate_browsers()), None))
+    return _browser_exe_cache[0]
 CDP_PORT = int(os.environ.get("GRPRICE_CDP_PORT", "9222"))
 BROWSER_OFFSCREEN = os.environ.get("GRPRICE_BROWSER_ONSCREEN", "").lower() not in (
     "1", "true", "yes")
@@ -203,9 +255,10 @@ def _browser_context():
     pw = sync_playwright().start()
 
     global CDP_URL
-    if not CDP_URL and BROWSER_EXE:
+    exe = find_browser()
+    if not CDP_URL and exe:
         try:
-            CDP_URL = _launch_own_browser()
+            CDP_URL = _launch_own_browser(exe)
         except Exception as e:
             pw.stop()
             raise RuntimeError(f"could not start {BROWSER_EXE}: {e}") from e
@@ -286,7 +339,7 @@ def _cdp_profile_dir(exe: str) -> str:
     return str(p)
 
 
-def _launch_own_browser() -> str:
+def _launch_own_browser(exe: str | None = None) -> str:
     """Start a browser with a debug port, so we own its lifetime and close it.
 
     Parked off-screen rather than run headless: headless is refused outright by
@@ -295,9 +348,12 @@ def _launch_own_browser() -> str:
     user's own session or tabs.
     """
     global _launched_proc
-    cmd = [BROWSER_EXE,
+    exe = exe or find_browser()
+    if not exe:
+        raise RuntimeError("no browser found to drive")
+    cmd = [exe,
            f"--remote-debugging-port={CDP_PORT}",
-           f"--user-data-dir={_cdp_profile_dir(BROWSER_EXE)}",
+           f"--user-data-dir={_cdp_profile_dir(exe)}",
            "--no-first-run", "--no-default-browser-check"]
     if BROWSER_OFFSCREEN:
         cmd += ["--window-position=-32000,-32000", "--window-size=1366,900"]
@@ -327,15 +383,21 @@ def _close_browser() -> None:
         except Exception:
             pass
     else:                           # attached over CDP
-        try:
-            attached.close()        # disconnect the session first
-        except Exception:
-            pass
         # Only shut the browser down if we were the ones who started it.
         # Attaching to a browser the user opened must never close their tabs.
         global _launched_proc
         if _launched_proc is not None:
             proc, _launched_proc = _launched_proc, None
+            # Ask the browser itself to quit, over its own debug session. On WSL
+            # a Windows browser is launched through an interop shim, so killing
+            # the process we spawned only reaps the shim and leaves the real
+            # browser running -- and we cannot just kill brave.exe, because the
+            # user's own windows share that name.
+            try:
+                session = attached.new_browser_cdp_session()
+                session.send("Browser.close")
+            except Exception:
+                pass
             try:
                 proc.terminate()
                 proc.wait(timeout=10)
@@ -344,6 +406,15 @@ def _close_browser() -> None:
                     proc.kill()
                 except Exception:
                     pass
+            try:
+                attached.close()    # drop the CDP session last
+            except Exception:
+                pass
+        else:
+            try:
+                attached.close()    # someone else's browser: just disconnect
+            except Exception:
+                pass
     try:
         pw.stop()
     except Exception:
@@ -1482,6 +1553,17 @@ def save_state(state: dict) -> None:
 
 
 def track_check(as_json: bool = False) -> list[dict]:
+    # The watch list is meant to run from cron, where launching a browser would
+    # be both surprising and useless. Force the HTTP path for the duration.
+    global USE_BROWSER
+    was, USE_BROWSER = USE_BROWSER, False
+    try:
+        return _track_check(as_json)
+    finally:
+        USE_BROWSER = was
+
+
+def _track_check(as_json: bool = False) -> list[dict]:
     state = load_state()
     report = []
     for item in state["items"]:
@@ -1536,9 +1618,12 @@ def main() -> None:
                         help="attach to a browser you started yourself, e.g. "
                              "http://127.0.0.1:9222 (implies --browser)")
     common.add_argument("--browser", action="store_true", default=argparse.SUPPRESS,
-                        help="read Skroutz through a real (headed) browser; the "
-                             "only transport Cloudflare lets through")
-    for a in ("--json", "--no-cache", "--plus", "--browser"):
+                        help="drive a browser for Skroutz (already the default)")
+    common.add_argument("--no-browser", action="store_true", dest="no_browser",
+                        default=argparse.SUPPRESS,
+                        help="skip the browser: fast, but BestPrice only, "
+                             "because Skroutz refuses plain HTTP clients")
+    for a in ("--json", "--no-cache", "--plus", "--browser", "--no-browser"):
         p.add_argument(a, action="store_true", default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)
     p.add_argument("--delivery", choices=["address", "point"],
@@ -1593,6 +1678,8 @@ def main() -> None:
         global CACHE_TTL
         CACHE_TTL = 0
     global USE_BROWSER, CDP_URL
+    if getattr(args, "no_browser", False):
+        USE_BROWSER = False
     if getattr(args, "cdp", None):
         CDP_URL = args.cdp
         USE_BROWSER = True

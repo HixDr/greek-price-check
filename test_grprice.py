@@ -53,13 +53,16 @@ class CloudflareChallengeTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self._orig_cache = grprice.CACHE_DIR
+        self._orig_browser = grprice.USE_BROWSER
         grprice.CACHE_DIR = Path(self._tmp.name)
+        grprice.USE_BROWSER = False        # these test the plain-HTTP transport
         grprice._last_request.clear()
         grprice._blocked_hosts.clear()
         self.addCleanup(self._restore)
 
     def _restore(self):
         grprice.CACHE_DIR = self._orig_cache
+        grprice.USE_BROWSER = self._orig_browser
         self._tmp.cleanup()
 
     def test_challenge_raises_blocked_not_generic_error(self):
@@ -827,11 +830,13 @@ class AttachedBrowserTests(unittest.TestCase):
         browser.close.assert_called_once()
 
     def test_launched_browser_is_closed_normally(self):
+        """With no browser discoverable, Playwright launches its own."""
         grprice.CDP_URL = ""
         ctx = unittest.mock.MagicMock()
         pw = unittest.mock.MagicMock()
         pw.chromium.launch_persistent_context.return_value = ctx
-        with self._stub_playwright(pw):
+        with self._stub_playwright(pw), \
+             unittest.mock.patch.object(grprice, "find_browser", return_value=None):
             grprice._browser_context()
         grprice._close_browser()
         ctx.close.assert_called_once()
@@ -859,6 +864,105 @@ class LaunchedBrowserProfileTests(unittest.TestCase):
                                       {"GRPRICE_CDP_PROFILE": "D:\\somewhere"}):
             self.assertEqual(grprice._cdp_profile_dir("/mnt/c/Users/x/brave.exe"),
                              "D:\\somewhere")
+
+class BrowserDiscoveryTests(unittest.TestCase):
+    """Using your own browser is the default, so it has to be found for you."""
+
+    def test_env_override_wins_over_discovery(self):
+        with unittest.mock.patch.dict(os.environ,
+                                      {"GRPRICE_BROWSER_EXE": "/custom/brave"}):
+            self.assertEqual(grprice.find_browser(), "/custom/brave")
+
+    def test_prefers_brave_then_chrome_then_edge(self):
+        present = {"/mnt/c/Users/x/AppData/Local/Microsoft/Edge/Application/msedge.exe",
+                   "/mnt/c/Users/x/AppData/Local/Google/Chrome/Application/chrome.exe",
+                   "/mnt/c/Users/x/AppData/Local/BraveSoftware/Brave-Browser/"
+                   "Application/brave.exe"}
+        with unittest.mock.patch.dict(os.environ, {}, clear=False), \
+             unittest.mock.patch.object(grprice, "_candidate_browsers",
+                                        return_value=sorted(present, key=lambda c: (
+                                            "brave" not in c, "chrome" not in c))):
+            got = grprice.find_browser()
+        self.assertIn("brave", got.lower())
+
+    def test_returns_none_when_nothing_is_installed(self):
+        grprice._browser_exe_cache.clear()
+        self.addCleanup(grprice._browser_exe_cache.clear)
+        with unittest.mock.patch.object(grprice, "BROWSER_EXE", ""), \
+             unittest.mock.patch.object(grprice, "_candidate_browsers", return_value=[]):
+            env = {k: v for k, v in os.environ.items() if k != "GRPRICE_BROWSER_EXE"}
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(grprice.find_browser())
+
+    def test_discovery_only_returns_paths_that_exist(self):
+        found = grprice._candidate_browsers()
+        for c in found:
+            self.assertTrue(os.path.exists(c), f"{c} does not exist")
+
+
+class BrowserDefaultTests(unittest.TestCase):
+    """The browser path is on unless explicitly turned off."""
+
+    def test_browser_is_on_by_default(self):
+        self.assertTrue(grprice.USE_BROWSER,
+                        "reading Skroutz needs a browser; it should not need a flag")
+
+    def test_track_check_never_opens_a_browser(self):
+        """The watch list is meant for cron. Cron must not launch a GUI."""
+        seen = {}
+
+        def fake_search(query, source="both", limit=8):
+            seen["browser"] = grprice.USE_BROWSER
+            return []
+
+        with unittest.mock.patch.object(grprice, "_search", side_effect=fake_search), \
+             unittest.mock.patch.object(grprice, "load_state",
+                                        return_value={"items": [{"query": "x"}]}), \
+             unittest.mock.patch.object(grprice, "save_state"):
+            grprice.track_check()
+        self.assertFalse(seen.get("browser", True),
+                         "track check ran with the browser enabled")
+
+class BrowserShutdownTests(unittest.TestCase):
+    """Closing a browser we launched, without touching one we did not.
+
+    On WSL a Windows browser is started through an interop shim, so terminating
+    the process we spawned reaps the shim and leaves the real browser running.
+    Windows showed nine brave.exe while WSL's ps showed three. The fix is to
+    ask the browser to quit over its own debug session -- killing by image name
+    is not an option, because the user's own windows share it.
+    """
+
+    def setUp(self):
+        self._orig = (grprice._browser, grprice._launched_proc, grprice.CDP_URL)
+        grprice._browser = None
+        grprice._launched_proc = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        grprice._browser, grprice._launched_proc, grprice.CDP_URL = self._orig
+
+    def test_browser_we_launched_is_told_to_quit(self):
+        attached = unittest.mock.MagicMock()
+        session = attached.new_browser_cdp_session.return_value
+        proc = unittest.mock.MagicMock()
+        grprice._browser = (unittest.mock.MagicMock(), unittest.mock.MagicMock(), attached)
+        grprice._launched_proc = proc
+
+        grprice._close_browser()
+
+        session.send.assert_called_once_with("Browser.close")
+        proc.terminate.assert_called_once()
+
+    def test_browser_we_attached_to_is_only_disconnected(self):
+        attached = unittest.mock.MagicMock()
+        grprice._browser = (unittest.mock.MagicMock(), unittest.mock.MagicMock(), attached)
+        grprice._launched_proc = None            # not ours to close
+
+        grprice._close_browser()
+
+        attached.new_browser_cdp_session.assert_not_called()
+        attached.close.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

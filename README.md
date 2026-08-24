@@ -23,32 +23,25 @@ Restart Claude Code, then just ask — *"what's a good wifi camera under €60?"
 For one project only, clone to `<project>/.claude/skills/greek-price-check`.
 
 Reading Skroutz needs a real browser, because it sits behind Cloudflare and
-refuses plain HTTP clients. Install the driver, then point it at a browser you
-already have:
+refuses plain HTTP clients. Install the driver:
 
 ```bash
-pip install playwright                      # driver only, no browser download
-export GRPRICE_BROWSER_EXE="/path/to/brave-or-chrome"
+pip install playwright     # driver only; it uses a browser you already have
 ```
 
-On Windows/WSL that path looks like
-`/mnt/c/Users/<you>/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe`;
-on Linux, `/usr/bin/google-chrome`. Add the export to your shell profile once.
-
-**Use your own browser, not a downloaded one.** `playwright install chromium`
-works as a fallback, but Skroutz's bot protection tends to trap
-Playwright-launched browsers in a "verify you are human" loop — see
-[Using your own browser](#using-your-own-browser-recommended-for-skroutz).
-Everything except the driver is Python 3.10+ stdlib, and no Skroutz account is
-needed.
+That's the only dependency — everything else is Python 3.10+ stdlib, and no
+Skroutz account is needed. **Your own browser is found and used automatically**
+(Brave, Chrome or Edge, on Windows/WSL, macOS or Linux). Set
+`GRPRICE_BROWSER_EXE` only if you want a specific one.
 
 ## Run
 
 ```bash
-scripts/grprice.py gather "wifi camera" --browser --plus
+scripts/grprice.py gather "wifi camera" --plus
 ```
 
-The browser starts off-screen, does its work, and closes itself.
+Your browser starts off-screen, does its work, and closes itself. Nothing to
+configure. Add `--no-browser` for a fast BestPrice-only lookup that skips it.
 
 It prints where the report landed:
 
@@ -68,7 +61,7 @@ runs/2026-08-24-wifi-camera/
 
 | Flag | Meaning |
 |---|---|
-| `--browser` | **required for Skroutz.** Without it you get BestPrice only |
+| `--no-browser` | skip the browser — fast, but BestPrice only |
 | `--plus` | you have Skroutz Plus — cost qualifying orders as free delivery |
 | `--limit N` | hits per source (default 16). The only cost dial |
 | `--max-price N` | skip detail on hits above this price |
@@ -104,15 +97,17 @@ Chromium and real Google Chrome alike get an endless "verify you are human"
 loop, from an IP whose ordinary browser loads the same page unchallenged.
 Attaching to a browser started outside Playwright clears it instantly.
 
-Point the tool at a browser and it will start one, use it, and shut it down:
+This is the default — nothing to switch on. The tool looks for Brave, then
+Chrome, then Edge (Windows browsers first under WSL, since those carry an
+ordinary desktop fingerprint), starts one off-screen, uses it, and shuts it
+down when the run ends. It uses a profile of its own, so it never touches your
+day-to-day browsing, tabs or logins.
+
+Override the choice if you want a specific browser:
 
 ```bash
 export GRPRICE_BROWSER_EXE="/mnt/c/Users/<you>/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe"
-scripts/grprice.py gather "wifi camera" --browser --plus
 ```
-
-The window is parked off-screen and closed when the run ends. It uses a profile
-of its own, so it never touches your day-to-day browsing, tabs or logins.
 
 Already have a browser running with a debug port? Attach to it instead:
 
@@ -154,13 +149,13 @@ port proxy.
 |---|---|---|
 | `GRPRICE_CACHE` | `~/.cache/grprice` | cache, runs, and watch-list directory |
 | `GRPRICE_TTL` | `900` | cache lifetime in seconds |
-| `GRPRICE_BROWSER` | unset | `1` to always read Skroutz through a browser |
+| `GRPRICE_BROWSER` | `1` | `0` to never use a browser (BestPrice only) |
 | `GRPRICE_SKROUTZ_PLUS` | unset | `1` if you have Skroutz Plus |
 | `GRPRICE_DELIVERY` | `address` | `address` or `point`, for Plus thresholds |
 | `GRPRICE_PLUS_ADDRESS_MIN` | `25` | Plus free-shipping floor to an address |
 | `GRPRICE_PLUS_POINT_MIN` | `15` | Plus free-shipping floor to a Skroutz Point |
 | `GRPRICE_CHALLENGE_WAIT` | `25` | seconds to let a challenge clear in the browser |
-| `GRPRICE_BROWSER_EXE` | unset | browser to start and attach to (see above) |
+| `GRPRICE_BROWSER_EXE` | auto-detected | override which browser to drive |
 | `GRPRICE_CDP_URL` | unset | attach to an already-running browser instead |
 | `GRPRICE_CDP_PORT` | `9222` | debug port for the browser we start |
 | `GRPRICE_BROWSER_ONSCREEN` | unset | `1` to show the window instead of hiding it |
