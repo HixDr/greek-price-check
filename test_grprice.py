@@ -1010,5 +1010,64 @@ class InterpreterTests(unittest.TestCase):
             grprice.ensure_playwright()
         self.assertEqual(calls, [], "re-exec ran again despite the guard")
 
+class PartialSourceTests(unittest.TestCase):
+    """Getting blocked partway through must not still report `complete`.
+
+    A real run gathered 91 candidates and reported complete=True while 17
+    Skroutz detail fetches had been refused by bot management. The search
+    succeeded, so the source was marked ok and nothing downgraded it -- the
+    exact shape of failure this tool exists to prevent.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig = (grprice.CACHE_DIR, grprice.USE_BROWSER)
+        grprice.CACHE_DIR = self.root / "cache"
+        grprice.USE_BROWSER = False
+        grprice._source_status.clear()
+        grprice._warned.clear()
+        grprice._blocked_hosts.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        grprice.CACHE_DIR, grprice.USE_BROWSER = self._orig
+        self._tmp.cleanup()
+
+    def test_blocked_detail_fetches_make_the_run_incomplete(self):
+        sk = [_hit("skroutz", i, 50 + i) for i in range(4)]
+        bp = [_hit("bestprice", i, 40 + i) for i in range(2)]
+
+        def half_blocked(url):
+            if "skroutz" in url and url.endswith(("2", "3")):
+                raise grprice.BlockedError("www.skroutz.gr", "bot management")
+            src = "skroutz" if "skroutz" in url else "bestprice"
+            return _detail(next(h for h in sk + bp if h["url"] == url))
+
+        with unittest.mock.patch.object(grprice, "skroutz_search", return_value=list(sk)), \
+             unittest.mock.patch.object(grprice, "bestprice_search", return_value=list(bp)), \
+             unittest.mock.patch.object(grprice, "offers", side_effect=half_blocked):
+            res = grprice.gather("x", runs_dir=self.root / "runs")
+
+        self.assertEqual(res["failed"], 2)
+        self.assertFalse(res["complete"],
+                         "a source blocked mid-run still reported complete")
+        states = {d["source"]: d["state"] for d in res["sources"]}
+        self.assertEqual(states["skroutz"], "blocked")
+        self.assertEqual(states["bestprice"], "ok")
+        report = (Path(res["run_dir"]) / "REPORT.txt").read_text()
+        self.assertIn("INCOMPLETE", report)
+
+    def test_a_clean_run_is_still_complete(self):
+        sk = [_hit("skroutz", 0, 50)]
+        bp = [_hit("bestprice", 0, 40)]
+        with unittest.mock.patch.object(grprice, "skroutz_search", return_value=list(sk)), \
+             unittest.mock.patch.object(grprice, "bestprice_search", return_value=list(bp)), \
+             unittest.mock.patch.object(grprice, "offers",
+                                        side_effect=lambda u: _detail(
+                                            next(h for h in sk + bp if h["url"] == u))):
+            res = grprice.gather("x", runs_dir=self.root / "runs")
+        self.assertTrue(res["complete"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

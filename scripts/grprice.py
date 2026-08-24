@@ -1115,9 +1115,17 @@ _source_status: dict[str, dict] = {}
 _warned: set = set()
 
 
-def _note_source(name: str, state: str, detail: str | None = None) -> None:
-    if _source_status.get(name, {}).get("state") == "ok":
-        return  # a later relaxation round failing doesn't undo an earlier success
+def _note_source(name: str, state: str, detail: str | None = None,
+                 force: bool = False) -> None:
+    """Record how a source fared. `force` downgrades one that already said ok.
+
+    Search retries with relaxed queries, so an later empty round must not undo
+    an earlier success -- hence the default. But a source that answered the
+    search and was then refused partway through the detail fetches *is*
+    degraded, and saying otherwise reports a partial market as the whole one.
+    """
+    if not force and _source_status.get(name, {}).get("state") == "ok":
+        return
     _source_status[name] = {"source": name, "state": state, "detail": detail}
 
 
@@ -1265,6 +1273,11 @@ def _detail_phase(rows: list, raw, seq: "_Seq", workers: int = 1) -> tuple[list,
             d.setdefault("name", h.get("name"))
         except Exception as e:
             err = str(e)
+            if isinstance(e, BlockedError):
+                # Refused partway through: this source's results are now partial,
+                # whatever the search reported earlier.
+                with _state_lock:
+                    _note_source(h.get("source"), "blocked", err, force=True)
             d = dict(h)
             d["detail_error"] = err
             d.setdefault("offers", [])
