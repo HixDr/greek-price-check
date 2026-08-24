@@ -23,21 +23,32 @@ Restart Claude Code, then just ask — *"what's a good wifi camera under €60?"
 For one project only, clone to `<project>/.claude/skills/greek-price-check`.
 
 Reading Skroutz needs a real browser, because it sits behind Cloudflare and
-refuses plain HTTP clients:
+refuses plain HTTP clients. Install the driver, then point it at a browser you
+already have:
 
 ```bash
-pip install playwright && playwright install chromium
+pip install playwright                      # driver only, no browser download
+export GRPRICE_BROWSER_EXE="/path/to/brave-or-chrome"
 ```
 
-That's the only dependency; everything else is Python 3.10+ stdlib. On WSL2 you
-need WSLg or an X server — a browser window opens while it runs. No Skroutz
-account is needed.
+On Windows/WSL that path looks like
+`/mnt/c/Users/<you>/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe`;
+on Linux, `/usr/bin/google-chrome`. Add the export to your shell profile once.
+
+**Use your own browser, not a downloaded one.** `playwright install chromium`
+works as a fallback, but Skroutz's bot protection tends to trap
+Playwright-launched browsers in a "verify you are human" loop — see
+[Using your own browser](#using-your-own-browser-recommended-for-skroutz).
+Everything except the driver is Python 3.10+ stdlib, and no Skroutz account is
+needed.
 
 ## Run
 
 ```bash
 scripts/grprice.py gather "wifi camera" --browser --plus
 ```
+
+The browser starts off-screen, does its work, and closes itself.
 
 It prints where the report landed:
 
@@ -68,7 +79,7 @@ runs/2026-08-24-wifi-camera/
 **`--limit` is what a run costs you.** Every hit gets a full detail fetch —
 Skroutz ~20s each through the browser, BestPrice ~2s. The default of 16 is
 chosen because BestPrice search pages top out at 16 results, so it captures that
-site completely; a measured run gave **32 candidates in 1m55s** (~130KB of
+site completely; a measured run gave **32 candidates in 37s** (~130KB of
 report). Raising it adds Skroutz only (~48 available there). Drop to
 `--limit 4` for a quick look.
 
