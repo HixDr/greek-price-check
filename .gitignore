@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv*/
+firebase-debug.log
+runs/
+.DS_Store
