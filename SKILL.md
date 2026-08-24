@@ -33,7 +33,10 @@ It prints the report path. **Read that file**, then recommend.
 ```
 
 - `--browser` is **required for Skroutz** — it is behind Cloudflare and refuses
-  plain HTTP. Without it you get BestPrice only.
+  plain HTTP. Without it you get BestPrice only. If `GRPRICE_BROWSER_EXE` is
+  set, the tool starts that browser off-screen and closes it when done;
+  otherwise it falls back to a Playwright-launched one, which Skroutz's bot
+  protection tends to challenge in a loop. Headless never works.
 - `--plus` — this user has Skroutz Plus. Always pass it (see Shipping below).
 - `--limit N` (default 16) is hits per source, and the only cost dial: **every**
   hit gets a full detail fetch. Measured: the default yields 32 candidates in

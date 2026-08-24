@@ -86,6 +86,41 @@ scripts/grprice.py track check                   # watch list; cron-safe, no bro
 scripts/grprice.py login                         # optional signed-in browser session
 ```
 
+## Using your own browser (recommended for Skroutz)
+
+Skroutz's bot protection refuses browsers that Playwright *launches* — bundled
+Chromium and real Google Chrome alike get an endless "verify you are human"
+loop, from an IP whose ordinary browser loads the same page unchallenged.
+Attaching to a browser started outside Playwright clears it instantly.
+
+Point the tool at a browser and it will start one, use it, and shut it down:
+
+```bash
+export GRPRICE_BROWSER_EXE="/mnt/c/Users/<you>/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe"
+scripts/grprice.py gather "wifi camera" --browser --plus
+```
+
+The window is parked off-screen and closed when the run ends. It uses a profile
+of its own, so it never touches your day-to-day browsing, tabs or logins.
+
+Already have a browser running with a debug port? Attach to it instead:
+
+```bash
+brave.exe --remote-debugging-port=9222 --user-data-dir=<some empty dir>
+scripts/grprice.py gather "wifi camera" --cdp http://127.0.0.1:9222 --plus
+```
+
+When attaching to a browser you started, the tool only disconnects at the end —
+it never closes your windows.
+
+**Headless does not work.** Real Brave in headless mode gets `403 Attention
+Required`, a hard block rather than a solvable challenge. That is why the window
+is real but hidden off-screen. Set `GRPRICE_BROWSER_ONSCREEN=1` to watch it.
+
+**WSL note:** with `networkingMode=mirrored` in `.wslconfig`, `127.0.0.1` reaches
+Windows directly and this just works. On default NAT networking you would need a
+port proxy.
+
 ## Notes
 
 - **Skroutz needs `--browser`, always.** It answers plain HTTP clients with a
@@ -114,3 +149,8 @@ scripts/grprice.py login                         # optional signed-in browser se
 | `GRPRICE_PLUS_ADDRESS_MIN` | `25` | Plus free-shipping floor to an address |
 | `GRPRICE_PLUS_POINT_MIN` | `15` | Plus free-shipping floor to a Skroutz Point |
 | `GRPRICE_CHALLENGE_WAIT` | `25` | seconds to let a challenge clear in the browser |
+| `GRPRICE_BROWSER_EXE` | unset | browser to start and attach to (see above) |
+| `GRPRICE_CDP_URL` | unset | attach to an already-running browser instead |
+| `GRPRICE_CDP_PORT` | `9222` | debug port for the browser we start |
+| `GRPRICE_BROWSER_ONSCREEN` | unset | `1` to show the window instead of hiding it |
+| `GRPRICE_INTERACTIVE_WAIT` | `180` | seconds to wait for a person to answer a challenge |

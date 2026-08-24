@@ -12,6 +12,8 @@ sends the user off waiting for a block that will never lift.
 import email.message
 import io
 import json
+import os
+import re
 import time
 import unittest
 import sys
@@ -220,7 +222,9 @@ class BrowserTransportTests(unittest.TestCase):
             def new_page(self_i): return FakePage()
 
         with unittest.mock.patch.object(grprice, "_browser_context",
-                                        return_value=FakeCtx()):
+                                        return_value=FakeCtx()), \
+             unittest.mock.patch.object(grprice, "CHALLENGE_WAIT", 0.01), \
+             unittest.mock.patch.object(grprice, "INTERACTIVE_WAIT", 0.01):
             with self.assertRaises(grprice.BlockedError):
                 grprice._browser_get("https://www.skroutz.gr/search?keyphrase=x")
 
@@ -549,6 +553,40 @@ class ConcurrentGatherTests(unittest.TestCase):
                         f"ran in {elapsed:.2f}s; 8 x 0.15s serial would be ~1.2s "
                         "- the legs are not overlapping")
 
+    def test_browser_is_only_ever_touched_from_the_main_thread(self):
+        """Playwright's sync API must be used from the thread that created it.
+
+        BestPrice details run in a worker, but its scroll-pagination needs the
+        same browser Skroutz drives on the main thread. Searching before the
+        threads start is what keeps that safe.
+        """
+        import threading
+        main = threading.get_ident()
+        seen = []
+
+        def scroll(query, limit):
+            seen.append(threading.get_ident())
+            return [str(8000 + i) for i in range(30)]
+
+        sk = [_hit("skroutz", i, 50 + i) for i in range(2)]
+
+        def bp_search(q, limit):
+            grprice._bestprice_scroll_ids(q, limit)
+            return [_hit("bestprice", i, 40 + i) for i in range(2)]
+
+        with unittest.mock.patch.object(grprice, "_bestprice_scroll_ids", side_effect=scroll), \
+             unittest.mock.patch.object(grprice, "skroutz_search", return_value=sk), \
+             unittest.mock.patch.object(grprice, "bestprice_search", side_effect=bp_search), \
+             unittest.mock.patch.object(grprice, "offers",
+                                        side_effect=lambda u: _detail(
+                                            {"source": "x", "name": "n", "url": u,
+                                             "price_from": 1.0})):
+            grprice.gather("x", runs_dir=self.root / "runs")
+
+        self.assertTrue(seen, "scroll pagination never ran")
+        self.assertEqual(seen[0], main,
+                         "browser scroll ran off the main thread - Playwright will break")
+
     def test_failures_in_one_source_do_not_lose_the_other(self):
         sk = [_hit("skroutz", i, 50 + i) for i in range(2)]
         bp = [_hit("bestprice", i, 40 + i) for i in range(2)]
@@ -568,6 +606,259 @@ class ConcurrentGatherTests(unittest.TestCase):
         self.assertIn("render died", report)
         for h in bp:
             self.assertIn(h["name"], report)
+
+def _sk_page(n, count=48):
+    """A Skroutz search page's JSON-LD, with distinct urls per page."""
+    items = [{"item": {"name": f"sk p{n} item {i}",
+                       "url": f"https://www.skroutz.gr/s/{n}{i:03d}/x.html",
+                       "offers": {"price": 10 + i, "offerCount": 3},
+                       "aggregateRating": {"ratingValue": 4.5, "reviewCount": 9}}}
+             for i in range(count)]
+    return ('<script type="application/ld+json">'
+            + json.dumps({"@type": "ItemList", "itemListElement": items})
+            + "</script>")
+
+
+def _bp_page(count=16):
+    items = [{"item": {"@type": "Product", "name": f"bp item {i}",
+                       "url": f"https://www.bestprice.gr/item/{9000+i}/x.html",
+                       "offers": {"lowPrice": 20 + i, "offerCount": 5}}}
+             for i in range(count)]
+    return ('<script type="application/ld+json">'
+            + json.dumps({"@type": "ItemList", "itemListElement": items})
+            + "</script>")
+
+
+class SearchPaginationTests(unittest.TestCase):
+    """--limit above one search page must actually fetch more, not silently cap."""
+
+    def setUp(self):
+        self._orig_browser = grprice.USE_BROWSER
+        self.addCleanup(lambda: setattr(grprice, "USE_BROWSER", self._orig_browser))
+
+    def test_skroutz_paginates_to_reach_the_limit(self):
+        pages = []
+
+        def fake_fetch(url, ttl=None, xhr=False):
+            m = re.search(r"[?&]page=(\d+)", url)
+            n = int(m.group(1)) if m else 1
+            pages.append(n)
+            return _sk_page(n)
+
+        with unittest.mock.patch.object(grprice, "fetch", side_effect=fake_fetch):
+            rows = grprice.skroutz_search("wifi camera", limit=100)
+        self.assertEqual(len(rows), 100)
+        self.assertGreaterEqual(len(pages), 3, f"only fetched pages {pages}")
+        self.assertEqual(len(rows), len({r["url"] for r in rows}), "duplicate urls")
+
+    def test_skroutz_single_page_when_limit_fits(self):
+        pages = []
+
+        def fake_fetch(url, ttl=None, xhr=False):
+            pages.append(url)
+            return _sk_page(1)
+
+        with unittest.mock.patch.object(grprice, "fetch", side_effect=fake_fetch):
+            rows = grprice.skroutz_search("x", limit=10)
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(pages), 1, "should not fetch page 2 when page 1 suffices")
+
+    def test_skroutz_stops_when_a_page_adds_nothing_new(self):
+        """A site that keeps serving page 1 must not loop forever."""
+        calls = []
+
+        def fake_fetch(url, ttl=None, xhr=False):
+            calls.append(url)
+            return _sk_page(1)          # same items every time
+
+        with unittest.mock.patch.object(grprice, "fetch", side_effect=fake_fetch):
+            rows = grprice.skroutz_search("x", limit=500)
+        self.assertEqual(len(rows), 48)
+        self.assertLessEqual(len(calls), grprice.MAX_SEARCH_PAGES + 1)
+
+    def test_bestprice_stays_on_http_within_the_jsonld_cap(self):
+        grprice.USE_BROWSER = True
+        with unittest.mock.patch.object(grprice, "fetch", return_value=_bp_page()), \
+             unittest.mock.patch.object(grprice, "_bestprice_scroll_ids") as scroll:
+            rows = grprice.bestprice_search("x", limit=16)
+        self.assertEqual(len(rows), 16)
+        scroll.assert_not_called()
+
+    def test_bestprice_harvests_ids_beyond_the_cap(self):
+        grprice.USE_BROWSER = True
+        extra = [str(7000 + i) for i in range(40)]
+        with unittest.mock.patch.object(grprice, "fetch", return_value=_bp_page()), \
+             unittest.mock.patch.object(grprice, "_bestprice_scroll_ids",
+                                        return_value=extra) as scroll:
+            rows = grprice.bestprice_search("x", limit=50)
+        scroll.assert_called_once()
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(len(rows), len({r["url"] for r in rows}))
+        harvested = [r for r in rows if r.get("from_pagination")]
+        self.assertTrue(harvested)
+        self.assertTrue(all(r["url"].startswith("https://www.bestprice.gr/item/")
+                            for r in harvested))
+        self.assertIsNone(harvested[0]["price_from"],
+                          "harvested rows carry no price until detailed")
+
+    def test_bestprice_does_not_scroll_without_a_browser(self):
+        grprice.USE_BROWSER = False
+        with unittest.mock.patch.object(grprice, "fetch", return_value=_bp_page()), \
+             unittest.mock.patch.object(grprice, "_bestprice_scroll_ids") as scroll:
+            rows = grprice.bestprice_search("x", limit=50)
+        self.assertEqual(len(rows), 16)
+        scroll.assert_not_called()
+
+class LocalisedChallengeTests(unittest.TestCase):
+    """Cloudflare localises its challenge, and we ask for el-GR.
+
+    The wait loop matched only the English "Just a moment...", so a Greek
+    challenge page ("Περιμένετε...") looked like a *cleared* page: the loop
+    exited instantly and the run was declared blocked without ever waiting.
+    """
+
+    def test_greek_interstitial_is_recognised(self):
+        html = "<html><head><title>Περιμένετε...</title></head><body></body></html>"
+        self.assertEqual(grprice._challenge_reason(None, html), "cloudflare")
+
+    def test_greek_turnstile_prompt_is_recognised(self):
+        html = "<html><body>Επαληθεύστε ότι είστε άνθρωπος</body></html>"
+        self.assertEqual(grprice._challenge_reason(None, html), "cloudflare")
+
+    def test_english_forms_still_recognised(self):
+        for html in ("<title>Just a moment...</title>",
+                     "<title>Attention Required! | Cloudflare</title>"):
+            self.assertEqual(grprice._challenge_reason(None, html), "cloudflare")
+
+    def test_a_real_page_is_not_mistaken_for_a_challenge(self):
+        html = ("<html><head><title>wifi camera | Skroutz.gr</title></head>"
+                "<body><script type=\"application/ld+json\">{}</script></body></html>")
+        self.assertIsNone(grprice._challenge_reason(None, html))
+
+    def test_challenge_titles_cover_both_languages(self):
+        self.assertTrue(grprice._is_challenge_title("Περιμένετε..."))
+        self.assertTrue(grprice._is_challenge_title("Just a moment..."))
+        self.assertFalse(grprice._is_challenge_title("wifi camera | Skroutz.gr"))
+
+class PageReadRaceTests(unittest.TestCase):
+    """Answering a challenge navigates the page mid-read. That is success."""
+
+    def test_retries_while_navigating_then_returns_content(self):
+        calls = []
+
+        class P:
+            def content(self_i):
+                calls.append(1)
+                if len(calls) < 3:
+                    raise Exception("Page.content: Unable to retrieve content "
+                                    "because the page is navigating and changing "
+                                    "the content.")
+                return "<html>real page</html>"
+            def wait_for_load_state(self_i, *a, **k): pass
+            def wait_for_timeout(self_i, ms): pass
+
+        self.assertEqual(grprice._page_html(P()), "<html>real page</html>")
+        self.assertEqual(len(calls), 3)
+
+    def test_unrelated_errors_are_not_swallowed(self):
+        class P:
+            def content(self_i):
+                raise Exception("target crashed")
+            def wait_for_load_state(self_i, *a, **k): pass
+            def wait_for_timeout(self_i, ms): pass
+
+        with self.assertRaises(Exception) as ctx:
+            grprice._page_html(P())
+        self.assertIn("target crashed", str(ctx.exception))
+
+class AttachedBrowserTests(unittest.TestCase):
+    """Attaching to a browser the user started, rather than launching one.
+
+    Playwright-launched browsers -- bundled Chromium and real Chrome alike --
+    hit an endless "verify you are human" loop from an IP whose ordinary
+    browser loaded the same page unchallenged. Attaching clears it instantly.
+    """
+
+    def setUp(self):
+        self._orig = (grprice._browser, grprice.CDP_URL)
+        grprice._browser = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        grprice._browser, grprice.CDP_URL = self._orig
+
+    def _fake_pw(self, browser):
+        pw = unittest.mock.MagicMock()
+        pw.chromium.connect_over_cdp.return_value = browser
+        return pw
+
+    @staticmethod
+    def _stub_playwright(pw):
+        """Playwright is an optional dependency, so the suite must run without it."""
+        import types
+        pkg = types.ModuleType("playwright")
+        mod = types.ModuleType("playwright.sync_api")
+        mod.sync_playwright = lambda: unittest.mock.MagicMock(start=lambda: pw)
+        pkg.sync_api = mod
+        return unittest.mock.patch.dict(
+            sys.modules, {"playwright": pkg, "playwright.sync_api": mod})
+
+    def test_cdp_url_attaches_instead_of_launching(self):
+        grprice.CDP_URL = "http://127.0.0.1:9222"
+        ctx = unittest.mock.MagicMock()
+        browser = unittest.mock.MagicMock(contexts=[ctx])
+        pw = self._fake_pw(browser)
+        with self._stub_playwright(pw):
+            got = grprice._browser_context()
+        self.assertIs(got, ctx)
+        pw.chromium.connect_over_cdp.assert_called_once_with("http://127.0.0.1:9222")
+        pw.chromium.launch_persistent_context.assert_not_called()
+
+    def test_closing_never_kills_a_browser_we_did_not_start(self):
+        """Their browser, their tabs. Detach, do not close."""
+        grprice.CDP_URL = "http://127.0.0.1:9222"
+        ctx = unittest.mock.MagicMock()
+        browser = unittest.mock.MagicMock(contexts=[ctx])
+        pw = self._fake_pw(browser)
+        with self._stub_playwright(pw):
+            grprice._browser_context()
+        grprice._close_browser()
+        ctx.close.assert_not_called()
+        browser.close.assert_called_once()
+
+    def test_launched_browser_is_closed_normally(self):
+        grprice.CDP_URL = ""
+        ctx = unittest.mock.MagicMock()
+        pw = unittest.mock.MagicMock()
+        pw.chromium.launch_persistent_context.return_value = ctx
+        with self._stub_playwright(pw):
+            grprice._browser_context()
+        grprice._close_browser()
+        ctx.close.assert_called_once()
+
+class LaunchedBrowserProfileTests(unittest.TestCase):
+    """A Windows browser driven from WSL cannot open a Linux profile path.
+
+    It does not complain -- it just never opens the debug port, which reads as
+    "the browser is broken" rather than "you passed a path it cannot use".
+    """
+
+    def test_windows_exe_gets_a_windows_profile_path(self):
+        got = grprice._cdp_profile_dir(
+            "/mnt/c/Users/HixPC/AppData/Local/BraveSoftware/Brave-Browser/"
+            "Application/brave.exe")
+        self.assertTrue(got.startswith("C:\\Users\\HixPC"), got)
+        self.assertNotIn("/", got)
+
+    def test_linux_exe_keeps_a_linux_path(self):
+        got = grprice._cdp_profile_dir("/usr/bin/google-chrome")
+        self.assertTrue(got.startswith("/"), got)
+
+    def test_explicit_override_wins(self):
+        with unittest.mock.patch.dict(os.environ,
+                                      {"GRPRICE_CDP_PROFILE": "D:\\somewhere"}):
+            self.assertEqual(grprice._cdp_profile_dir("/mnt/c/Users/x/brave.exe"),
+                             "D:\\somewhere")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

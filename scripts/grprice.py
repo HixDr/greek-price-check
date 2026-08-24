@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -100,7 +101,27 @@ USE_BROWSER = os.environ.get("GRPRICE_BROWSER", "").lower() in ("1", "true", "ye
 BROWSER_HEADLESS = os.environ.get("GRPRICE_BROWSER_HEADLESS", "").lower() in ("1", "true", "yes")
 BROWSER_HOSTS = {"www.skroutz.gr"}
 BROWSER_PROFILE = CACHE_DIR / "browser-profile"
+# Which browser build to drive. "chrome" is real Google Chrome; empty string
+# forces Playwright's bundled Chromium.
+BROWSER_CHANNEL = os.environ.get("GRPRICE_BROWSER_CHANNEL", "chrome")
+# Attach to a browser you started yourself, instead of launching one.
+# Playwright-launched browsers -- bundled Chromium and real Chrome alike -- got
+# an endless "verify you are human" loop from an IP whose ordinary browser
+# loaded the same page unchallenged. Driving a browser a person opened clears
+# it instantly. See README "Using your own browser".
+CDP_URL = os.environ.get("GRPRICE_CDP_URL", "")
+# A browser executable to start ourselves, attach to, and shut down when done.
+# Headless is not an option: real Brave in headless mode gets 403 "Attention
+# Required" -- a hard block, not a solvable challenge -- so the window is real
+# but parked off-screen where nobody has to look at it.
+BROWSER_EXE = os.environ.get("GRPRICE_BROWSER_EXE", "")
+CDP_PORT = int(os.environ.get("GRPRICE_CDP_PORT", "9222"))
+BROWSER_OFFSCREEN = os.environ.get("GRPRICE_BROWSER_ONSCREEN", "").lower() not in (
+    "1", "true", "yes")
+_launched_proc = None
 CHALLENGE_WAIT = float(os.environ.get("GRPRICE_CHALLENGE_WAIT", "25"))
+# How long to wait for a person to answer an interactive "are you human" box.
+INTERACTIVE_WAIT = float(os.environ.get("GRPRICE_INTERACTIVE_WAIT", "180"))
 _browser = None
 
 
@@ -110,6 +131,22 @@ class BlockedError(RuntimeError):
     def __init__(self, host: str, message: str):
         super().__init__(message)
         self.host = host
+
+
+# Cloudflare localises its challenge pages, and this tool asks for el-GR, so the
+# Greek wording matters as much as the English. Matching only "Just a moment"
+# made a Greek challenge look like a *cleared* page.
+CHALLENGE_MARKERS = (
+    "just a moment", "attention required",
+    "περιμένετε",                       # "Just a moment..."
+    "επαληθεύστε ότι είστε άνθρωπος",   # "Verify you are human" (Turnstile)
+    "ελέγχεται η ασφάλεια",             # "Checking your browser"
+)
+
+
+def _is_challenge_title(title: str) -> bool:
+    t = (title or "").lower()
+    return any(m in t for m in CHALLENGE_MARKERS)
 
 
 def _challenge_reason(headers, body: str) -> str | None:
@@ -125,9 +162,9 @@ def _challenge_reason(headers, body: str) -> str | None:
     low = body.lower()
     if (get("cf-mitigated") or "").lower() == "challenge":
         return "cloudflare"
-    if "just a moment" in low or "challenges.cloudflare.com" in body:
+    if any(m in low for m in CHALLENGE_MARKERS):
         return "cloudflare"
-    if "attention required" in low and "cloudflare" in low:
+    if "challenges.cloudflare.com" in body:
         return "cloudflare"
     if "cloudflare" in (get("server") or "").lower() and "cf-chl" in low:
         return "cloudflare"
@@ -163,40 +200,177 @@ def _browser_context():
             "    pip install playwright && playwright install chromium\n"
             "Everything else in this tool remains stdlib-only.") from e
 
+    pw = sync_playwright().start()
+
+    global CDP_URL
+    if not CDP_URL and BROWSER_EXE:
+        try:
+            CDP_URL = _launch_own_browser()
+        except Exception as e:
+            pw.stop()
+            raise RuntimeError(f"could not start {BROWSER_EXE}: {e}") from e
+
+    if CDP_URL:
+        # Attach to an already-running browser. Its pages belong to whoever
+        # started it, so _close_browser only detaches -- it never closes it.
+        try:
+            browser = pw.chromium.connect_over_cdp(CDP_URL)
+        except Exception as e:
+            pw.stop()
+            raise RuntimeError(
+                f"could not attach to a browser at {CDP_URL}: {e}\n"
+                "Start one with --remote-debugging-port and a spare profile, e.g.\n"
+                "  brave.exe --remote-debugging-port=9222 "
+                "--user-data-dir=<some empty dir>") from e
+        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        _browser = (pw, ctx, browser)
+        atexit.register(_close_browser)
+        return ctx
+
     if BROWSER_HEADLESS:
         print("warning: headless Chromium is hard-blocked by Cloudflare; "
               "headed is the mode that works.", file=sys.stderr)
     BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
-    pw = sync_playwright().start()
-    # A persistent profile keeps cookies between runs, so the challenge is
-    # cleared once rather than on every invocation. Greek locale/timezone
+    # A persistent profile keeps cookies between runs, so a challenge is
+    # answered once rather than on every invocation. Greek locale/timezone
     # because that is the market being queried.
-    ctx = pw.chromium.launch_persistent_context(
+    opts = dict(
         user_data_dir=str(BROWSER_PROFILE),
         headless=BROWSER_HEADLESS,
         locale="el-GR",
         timezone_id="Europe/Athens",
         viewport={"width": 1366, "height": 900},
     )
-    _browser = (pw, ctx)
+    # Prefer real Google Chrome over Playwright's bundled Chromium. They are
+    # different builds -- the bundled one lacks proprietary codecs and Widevine
+    # among other things -- and Cloudflare treats them differently: on this
+    # project the bundled build hit an endless "verify you are human" loop from
+    # an IP whose ordinary Chrome loaded the same page without being asked.
+    # This is not about hiding automation; it is about running the same browser
+    # a person here actually runs.
+    ctx = None
+    if BROWSER_CHANNEL:
+        try:
+            ctx = pw.chromium.launch_persistent_context(channel=BROWSER_CHANNEL, **opts)
+        except Exception as e:
+            print(f"warning: real '{BROWSER_CHANNEL}' not available ({str(e)[:70]}); "
+                  f"falling back to Playwright's bundled Chromium, which Cloudflare "
+                  f"is markedly better at spotting.\n"
+                  f"  Install it with:  python -m playwright install chrome",
+                  file=sys.stderr)
+    if ctx is None:
+        ctx = pw.chromium.launch_persistent_context(**opts)
+    _browser = (pw, ctx, None)
     atexit.register(_close_browser)
     return ctx
+
+
+def _cdp_profile_dir(exe: str) -> str:
+    """Where the launched browser keeps its profile.
+
+    A Windows browser driven from WSL cannot open a Linux path, and fails
+    silently rather than complaining -- the debug port simply never comes up.
+    So for a /mnt/... executable the profile lives on the Windows side and is
+    handed over as a Windows path.
+    """
+    override = os.environ.get("GRPRICE_CDP_PROFILE")
+    if override:
+        return override
+    parts = exe.split("/")
+    if exe.startswith("/mnt/") and len(parts) > 4 and parts[3] == "Users":
+        drive, user = parts[2], parts[4]
+        Path(f"/mnt/{drive}/Users/{user}/.grprice-cdp").mkdir(parents=True, exist_ok=True)
+        return f"{drive.upper()}:\\Users\\{user}\\.grprice-cdp"
+    p = CACHE_DIR / "cdp-profile"
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+
+def _launch_own_browser() -> str:
+    """Start a browser with a debug port, so we own its lifetime and close it.
+
+    Parked off-screen rather than run headless: headless is refused outright by
+    the sites this drives (403 "Attention Required", not a solvable challenge).
+    The profile is separate from any daily browsing, so this never touches the
+    user's own session or tabs.
+    """
+    global _launched_proc
+    cmd = [BROWSER_EXE,
+           f"--remote-debugging-port={CDP_PORT}",
+           f"--user-data-dir={_cdp_profile_dir(BROWSER_EXE)}",
+           "--no-first-run", "--no-default-browser-check"]
+    if BROWSER_OFFSCREEN:
+        cmd += ["--window-position=-32000,-32000", "--window-size=1366,900"]
+    _launched_proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    url = f"http://127.0.0.1:{CDP_PORT}"
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{url}/json/version", timeout=2):
+                return url
+        except Exception:
+            time.sleep(0.5)
+    raise RuntimeError(f"debug port {CDP_PORT} never came up")
 
 
 def _close_browser() -> None:
     global _browser
     if _browser is None:
         return
-    pw, ctx = _browser
+    pw, ctx, attached = _browser
     _browser = None
-    try:
-        ctx.close()
-    except Exception:
-        pass
+    if attached is None:            # we launched it, so we close it
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    else:                           # attached over CDP
+        try:
+            attached.close()        # disconnect the session first
+        except Exception:
+            pass
+        # Only shut the browser down if we were the ones who started it.
+        # Attaching to a browser the user opened must never close their tabs.
+        global _launched_proc
+        if _launched_proc is not None:
+            proc, _launched_proc = _launched_proc, None
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
     try:
         pw.stop()
     except Exception:
         pass
+
+
+def _page_html(page, tries: int = 6) -> str:
+    """Read a page's HTML, tolerating a navigation in progress.
+
+    When a challenge is answered the page immediately navigates to the real
+    content, and a read landing in that window raises "Unable to retrieve
+    content because the page is navigating". That is success, not failure --
+    wait for it to settle and read again.
+    """
+    last = None
+    for i in range(tries):
+        try:
+            return page.content()
+        except Exception as e:
+            last = e
+            if "navigat" not in str(e).lower():
+                raise
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                page.wait_for_timeout(800)
+    raise RuntimeError(f"could not read page after {tries} tries: {last}")
 
 
 def _browser_get(url: str) -> str:
@@ -205,14 +379,29 @@ def _browser_get(url: str) -> str:
     page = _browser_context().new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        # A managed challenge clears itself in a real browser after a few
+        # A passive challenge clears itself in a real browser after a few
         # seconds. Poll the title rather than sleeping a flat interval.
         deadline = time.time() + CHALLENGE_WAIT
         while time.time() < deadline:
-            if "just a moment" not in (page.title() or "").lower():
+            if not _is_challenge_title(page.title() or ""):
                 break
             page.wait_for_timeout(500)
-        html = page.content()
+
+        html = _page_html(page)
+        if _challenge_reason(None, html) and not BROWSER_HEADLESS:
+            # Cloudflare has escalated to an interactive checkbox ("verify you
+            # are human"). That control is meant to be answered by a person, so
+            # this asks the person who is already looking at the window rather
+            # than clicking it for them. The profile is persistent, so once
+            # solved the clearance cookie carries the rest of the run.
+            if _prompt_for_challenge(host):
+                waited = time.time() + INTERACTIVE_WAIT
+                while time.time() < waited:
+                    if not _is_challenge_title(page.title() or ""):
+                        break
+                    page.wait_for_timeout(1000)
+                html = _page_html(page)
+
         if _challenge_reason(None, html):
             msg = _blocked_message(host)
             _blocked_hosts[host] = msg
@@ -220,6 +409,26 @@ def _browser_get(url: str) -> str:
         return html
     finally:
         page.close()
+
+
+_prompted_hosts: set = set()
+
+
+def _prompt_for_challenge(host: str) -> bool:
+    """Ask the human at the keyboard to answer an interactive challenge.
+
+    Returns False if we already asked for this host -- one unanswered prompt is
+    enough, and every later fetch should fail fast instead of stalling again.
+    """
+    if host in _prompted_hosts:
+        return False
+    _prompted_hosts.add(host)
+    print(f"\n  {host} is showing a 'verify you are human' checkbox.\n"
+          f"  Please click it in the browser window that is open; the run will\n"
+          f"  continue by itself. Waiting up to {int(INTERACTIVE_WAIT)}s.\n"
+          f"  (This usually means a VPN or datacenter exit IP -- from a normal\n"
+          f"  connection Skroutz tends not to ask at all.)\n", file=sys.stderr)
+    return True
 
 
 def browser_login(url: str = "https://www.skroutz.gr/") -> None:
@@ -369,10 +578,12 @@ def _price(v) -> float | None:
 # ---------------------------------------------------------------- skroutz
 
 SKROUTZ_SEARCH = "https://www.skroutz.gr/search?keyphrase={}"
+SKROUTZ_SEARCH_PAGE = "https://www.skroutz.gr/search?keyphrase={}&page={}"
+# Safety stop for page walking: a site that keeps serving page 1 must not loop.
+MAX_SEARCH_PAGES = 6
 
 
-def skroutz_search(query: str, limit: int = 8) -> list[dict]:
-    html = fetch(SKROUTZ_SEARCH.format(urllib.parse.quote_plus(query)))
+def _skroutz_rows(html: str) -> list[dict]:
     results = []
     for block in ld_blocks(html):
         if not isinstance(block, dict) or block.get("@type") != "ItemList":
@@ -390,18 +601,43 @@ def skroutz_search(query: str, limit: int = 8) -> list[dict]:
                 "rating": rating.get("ratingValue"),
                 "reviews": rating.get("reviewCount"),
             })
+    return results
+
+
+def skroutz_search(query: str, limit: int = 8) -> list[dict]:
+    """Search Skroutz, walking pages until `limit` is satisfied.
+
+    One search page carries ~48 products in its JSON-LD. Asking for more used
+    to cap silently at whatever page 1 held; Skroutz paginates properly
+    (`rel=next`), so walk it. Stops early when a page adds nothing new, which
+    also guards against a site that keeps serving page 1.
+    """
+    q = urllib.parse.quote_plus(query)
+    first_html, rows, seen = None, [], set()
+    for page in range(1, MAX_SEARCH_PAGES + 1):
+        url = SKROUTZ_SEARCH.format(q) if page == 1 else SKROUTZ_SEARCH_PAGE.format(q, page)
+        html = fetch(url)
+        if first_html is None:
+            first_html = html
+        fresh = [r for r in _skroutz_rows(html)
+                 if r.get("url") and r["url"] not in seen]
+        for r in fresh:
+            seen.add(r["url"])
+        rows += fresh
+        if len(rows) >= limit or not fresh:
+            break
+
     # A single exact match redirects straight to the SKU page.
-    if not results:
-        one = skroutz_offers(_canonical(html) or SKROUTZ_SEARCH.format(
-            urllib.parse.quote_plus(query)))
+    if not rows:
+        one = skroutz_offers(_canonical(first_html or "") or SKROUTZ_SEARCH.format(q))
         if one.get("name"):
-            results.append({
+            rows.append({
                 "source": "skroutz", "name": one["name"], "url": one["url"],
                 "price_from": one.get("price_from"),
                 "shops": len(one.get("offers", [])),
                 "rating": one.get("rating"), "reviews": one.get("reviews"),
             })
-    return results[:limit]
+    return rows[:limit]
 
 
 def _canonical(html: str) -> str | None:
@@ -546,8 +782,50 @@ def skroutz_offers(url: str) -> dict:
 BESTPRICE_SEARCH = "https://www.bestprice.gr/search?q={}"
 
 
-def bestprice_search(query: str, limit: int = 8) -> list[dict]:
-    html = fetch(BESTPRICE_SEARCH.format(urllib.parse.quote_plus(query)))
+BESTPRICE_ITEM = "https://www.bestprice.gr/item/{}/x.html"
+# What one BestPrice search page describes in JSON-LD. The page itself loads
+# far more by infinite scroll, but only these first rows are in structured data.
+BESTPRICE_LD_ROWS = 16
+BESTPRICE_SCROLLS = 12
+
+
+def _bestprice_scroll_ids(query: str, limit: int) -> list[str]:
+    """Let BestPrice's own JavaScript paginate, and harvest the item ids.
+
+    BestPrice has no pagination in its markup and no usable URL parameter: the
+    search page infinite-scrolls via an XHR built inside a JS bundle (a POST
+    carrying `fromPagination`/`pg`, which answers 307 to `/` when replayed by
+    hand). Driving the real page sidesteps reverse-engineering an undocumented
+    internal endpoint, and survives them changing it.
+
+    Only the numeric id is taken from the DOM -- `/item/<id>` is about as stable
+    a pattern as this site offers -- and every actual field still comes from the
+    JSON-LD on the item page itself. Verified: any slug resolves, only the id
+    matters.
+    """
+    url = BESTPRICE_SEARCH.format(urllib.parse.quote_plus(query))
+    page = _browser_context().new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        ids, stale = [], 0
+        for _ in range(BESTPRICE_SCROLLS):
+            found = list(dict.fromkeys(re.findall(r"/item/(\d+)", _page_html(page))))
+            if len(found) > len(ids):
+                ids, stale = found, 0
+            else:
+                stale += 1
+                if stale >= 2:      # two quiet scrolls: the list is exhausted
+                    break
+            if len(ids) >= limit:
+                break
+            page.mouse.wheel(0, 20000)
+            page.wait_for_timeout(1500)
+        return ids
+    finally:
+        page.close()
+
+
+def _bestprice_rows(html: str) -> list[dict]:
     results = []
     for block in ld_blocks(html):
         if not isinstance(block, dict):
@@ -572,7 +850,45 @@ def bestprice_search(query: str, limit: int = 8) -> list[dict]:
                 "rating": (item.get("aggregateRating") or {}).get("ratingValue"),
                 "reviews": (item.get("aggregateRating") or {}).get("reviewCount"),
             })
-    return results[:limit]
+    return results
+
+
+def bestprice_search(query: str, limit: int = 8) -> list[dict]:
+    """Search BestPrice, scrolling for more than the JSON-LD describes.
+
+    The search page's structured data covers only the first ~16 products. Past
+    that we need the browser to drive the site's own infinite scroll; without
+    one, 16 is the honest ceiling and the caller is told so via the report.
+    """
+    rows = _bestprice_rows(fetch(BESTPRICE_SEARCH.format(urllib.parse.quote_plus(query))))
+    if len(rows) >= limit or not USE_BROWSER:
+        return rows[:limit]
+
+    seen = set()
+    for r in rows:
+        m = re.search(r"/item/(\d+)", r.get("url") or "")
+        if m:
+            seen.add(m.group(1))
+    try:
+        harvested = _bestprice_scroll_ids(query, limit)
+    except Exception as e:                 # scrolling is a bonus, never fatal
+        _warn(f"bestprice: could not scroll for more than {len(rows)} results: {e}")
+        return rows[:limit]
+
+    for iid in harvested:
+        if len(rows) >= limit:
+            break
+        if iid in seen:
+            continue
+        seen.add(iid)
+        # Fields stay None on purpose: they come from the item page's JSON-LD
+        # when this row is detailed, never from scraped list markup.
+        rows.append({"source": "bestprice", "name": None,
+                     "url": BESTPRICE_ITEM.format(iid),
+                     "price_from": None, "shops": None,
+                     "rating": None, "reviews": None,
+                     "from_pagination": True})
+    return rows[:limit]
 
 
 def bestprice_offers(url: str) -> dict:
@@ -776,33 +1092,39 @@ class _Seq:
             return self._n
 
 
-def _gather_leg(name: str, query: str, limit: int, max_price: float | None,
-                raw, seq: "_Seq", workers: int = 1) -> tuple[list, list, int, int]:
-    """Search one site and detail every hit it returned.
+def _search_phase(name: str, query: str, limit: int, max_price: float | None,
+                  raw, seq: "_Seq") -> tuple[list, dict, int]:
+    """Search one site. Runs on the main thread.
 
-    Returns (fetch_records, candidates, failed, price_filtered_out). Runs
-    entirely within one thread so the two sites can proceed independently --
-    one site being slow no longer holds the other up.
+    Searching happens before any worker threads start because BestPrice's
+    scroll-pagination needs the same Playwright browser Skroutz drives, and the
+    sync API must be used from the thread that created it. Only the detail
+    fetches are parallelised.
     """
     t0 = time.time()
     rows = _search_source(name, query, limit)
-    with _state_lock:
-        status = next((d for d in source_report() if d["source"] == name), {})
-    fetches = [{
+    status = next((d for d in source_report() if d["source"] == name), {})
+    rec = {
         "file": _write_raw(raw, seq.next(), f"search-{name}",
                            {"query": query, "source": name, "rows": rows}),
         "kind": "search", "target": name,
         "status": "ok" if status.get("state") == "ok" else status.get("state"),
         "rows": len(rows), "seconds": round(time.time() - t0, 1),
         "error": status.get("detail"),
-    }]
-
+    }
     dropped = 0
     if max_price is not None:
         before = len(rows)
+        # Rows harvested by scroll-pagination carry no price yet, so they cannot
+        # be filtered here; they get dropped after their detail fetch instead.
         rows = [h for h in rows
                 if h.get("price_from") is None or h["price_from"] <= max_price]
         dropped = before - len(rows)
+    return rows, rec, dropped
+
+
+def _detail_phase(rows: list, raw, seq: "_Seq", workers: int = 1) -> tuple[list, list, int]:
+    """Fetch full detail for every row. Safe to run in a worker thread."""
 
     def one(h):
         t = time.time()
@@ -833,8 +1155,8 @@ def _gather_leg(name: str, query: str, limit: int, max_price: float | None,
     else:
         results = [one(h) for h in rows]
 
-    fetches += [r[0] for r in results]
-    return fetches, [r[1] for r in results], sum(r[2] for r in results), dropped
+    return ([r[0] for r in results], [r[1] for r in results],
+            sum(r[2] for r in results))
 
 
 def gather(query: str, source: str = "both", limit: int = 16,
@@ -862,39 +1184,53 @@ def gather(query: str, source: str = "both", limit: int = 16,
     raw.mkdir(parents=True, exist_ok=True)
 
     seq = _Seq()
-    legs: dict[str, tuple] = {}
+    want = [n for n in ("skroutz", "bestprice") if source in (n, "both")]
 
-    def run_leg(name, workers):
+    # Phase 1: search, on this thread. Must precede any workers -- BestPrice's
+    # scroll-pagination drives the same browser Skroutz uses, and Playwright's
+    # sync API belongs to the thread that created it.
+    searched, fetches, dropped = {}, [], 0
+    for name in want:
         try:
-            legs[name] = _gather_leg(name, query, limit, max_price, raw, seq, workers)
-        except Exception as e:                      # a whole leg dying is survivable
+            rows, rec, drop = _search_phase(name, query, limit, max_price, raw, seq)
+        except Exception as e:
             _note_source(name, "error", str(e))
             _warn(f"{name}: {e}")
-            legs[name] = ([], [], 0, 0)
+            rows, rec, drop = [], None, 0
+        searched[name] = rows
+        dropped += drop
+        if rec:
+            fetches.append(rec)
 
-    want = [n for n in ("skroutz", "bestprice") if source in (n, "both")]
-    # BestPrice moves to a worker thread; Skroutz stays on this one because
-    # Playwright's sync API must be used from the thread that created it (and
-    # that is where atexit closes the browser). BestPrice is plain HTTP and
-    # latency-bound, so it also gets a small pool to overlap round-trips.
+    # Phase 2: details, concurrently. BestPrice is plain HTTP and latency-bound,
+    # so it also gets a small pool to overlap round-trips; Skroutz keeps this
+    # thread because of the browser.
+    legs: dict[str, tuple] = {}
+
+    def run_details(name, workers):
+        try:
+            legs[name] = _detail_phase(searched.get(name, []), raw, seq, workers)
+        except Exception as e:
+            _note_source(name, "error", str(e))
+            _warn(f"{name}: {e}")
+            legs[name] = ([], [], 0)
+
     side = None
     if "bestprice" in want:
-        side = threading.Thread(target=run_leg, args=("bestprice", 4), daemon=True)
+        side = threading.Thread(target=run_details, args=("bestprice", 4), daemon=True)
         side.start()
     if "skroutz" in want:
-        run_leg("skroutz", 1)
+        run_details("skroutz", 1)
     if side:
         side.join()
 
-    fetches, candidates, failed, dropped, hits = [], [], 0, 0, []
+    candidates, failed = [], 0
     for name in want:                               # deterministic merge order
-        f, c, fail, drop = legs.get(name, ([], [], 0, 0))
+        f, c, fail = legs.get(name, ([], [], 0))
         fetches += f
         candidates += c
         failed += fail
-        dropped += drop
-        hits += c
-    record_history([h for h in hits if h.get("price_from") is not None])
+    record_history([c for c in candidates if c.get("price_from") is not None])
 
     # Presentation order only. Nothing is dropped and nothing is preferred.
     candidates.sort(key=lambda c: (
@@ -1196,6 +1532,9 @@ def main() -> None:
     common.add_argument("--delivery", choices=["address", "point"],
                         default=argparse.SUPPRESS,
                         help="where Plus free-shipping thresholds apply")
+    common.add_argument("--cdp", default=argparse.SUPPRESS, metavar="URL",
+                        help="attach to a browser you started yourself, e.g. "
+                             "http://127.0.0.1:9222 (implies --browser)")
     common.add_argument("--browser", action="store_true", default=argparse.SUPPRESS,
                         help="read Skroutz through a real (headed) browser; the "
                              "only transport Cloudflare lets through")
@@ -1253,7 +1592,10 @@ def main() -> None:
     if getattr(args, "no_cache", False):
         global CACHE_TTL
         CACHE_TTL = 0
-    global USE_BROWSER
+    global USE_BROWSER, CDP_URL
+    if getattr(args, "cdp", None):
+        CDP_URL = args.cdp
+        USE_BROWSER = True
     if getattr(args, "browser", False) or args.cmd == "login":
         USE_BROWSER = True
 
