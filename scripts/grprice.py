@@ -237,6 +237,60 @@ def _blocked_message(host: str) -> str:
             f"does not clear it; use --source bestprice for usable numbers.")
 
 
+# ------------------------------------------------------- interpreter
+
+# Playwright is an optional dependency and usually lives in a venv, but this
+# script gets invoked as `python3 scripts/grprice.py` by whatever interpreter
+# happens to be on PATH. When that one lacks Playwright, Skroutz quietly drops
+# out of the results: the run still "succeeds", reporting complete=False and
+# half the market, with the real reason buried in a warning. Rather than make
+# every caller know which python to use, find one that works and re-launch.
+
+REEXEC_FLAG = "GRPRICE_REEXECED"
+
+
+def _venv_candidates() -> list:
+    here = Path(__file__).resolve().parent
+    cands = []
+    explicit = os.environ.get("GRPRICE_PYTHON")
+    if explicit:
+        cands.append(Path(explicit).parent.parent)
+    cands += [CACHE_DIR / "venv", here.parent / ".venv", here.parent / ".venv-browser",
+              here / ".venv", Path.home() / ".venv"]
+    return cands
+
+
+def _python_with_playwright(candidates) -> str | None:
+    """The interpreter of the first venv that actually has Playwright installed."""
+    for venv in candidates:
+        venv = Path(venv)
+        if not glob.glob(str(venv / "lib" / "python*" / "site-packages" / "playwright")):
+            continue
+        for exe in (venv / "bin" / "python", venv / "bin" / "python3",
+                    venv / "Scripts" / "python.exe"):
+            if exe.exists():
+                return str(exe)
+    return None
+
+
+def ensure_playwright() -> None:
+    """Re-launch into an interpreter that has Playwright, if this one lacks it."""
+    if os.environ.get(REEXEC_FLAG):
+        return
+    try:
+        import playwright  # noqa: F401
+        return
+    except ImportError:
+        pass
+    found = _python_with_playwright(_venv_candidates())
+    if not found:
+        return                      # caller reports it; see _browser_context
+    os.environ[REEXEC_FLAG] = "1"
+    print(f"note: re-running with {found} (this python has no Playwright)",
+          file=sys.stderr)
+    os.execv(found, [found, os.path.abspath(__file__), *sys.argv[1:]])
+
+
 # ------------------------------------------------------- browser transport
 
 def _browser_context():
@@ -248,9 +302,15 @@ def _browser_context():
         from playwright.sync_api import sync_playwright
     except ImportError as e:
         raise RuntimeError(
-            "--browser needs Playwright, which is an optional dependency:\n"
-            "    pip install playwright && playwright install chromium\n"
-            "Everything else in this tool remains stdlib-only.") from e
+            "Reading Skroutz needs Playwright, which is an optional dependency "
+            "and was not found in this interpreter\n"
+            f"  ({sys.executable}).\n"
+            "Create a venv for it once and it will be picked up automatically:\n"
+            f"    python3 -m venv {CACHE_DIR / 'venv'}\n"
+            f"    {CACHE_DIR / 'venv' / 'bin' / 'pip'} install playwright\n"
+            "Or run with --no-browser for BestPrice-only results.\n"
+            "It drives a browser you already have; no browser download is "
+            "needed.") from e
 
     pw = sync_playwright().start()
 
@@ -1667,6 +1727,9 @@ def main() -> None:
     tsub.add_parser("check", parents=[common])
 
     args = p.parse_args()
+    # Do this before anything expensive: it may replace this process entirely.
+    if not getattr(args, "no_browser", False) and args.cmd in ("gather", "offers", "login"):
+        ensure_playwright()
     as_json = getattr(args, "json", False)
     if getattr(args, "plus", False):
         global SKROUTZ_PLUS

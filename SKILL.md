@@ -20,8 +20,12 @@ deliberately, because those are your judgements to make and explain.
 ## The main flow
 
 ```bash
-python3 scripts/grprice.py gather "wifi camera εξωτερικου χωρου" --browser --plus
+python3 scripts/grprice.py gather "wifi camera εξωτερικου χωρου" --plus
 ```
+
+Plain `python3` is fine — if that interpreter lacks Playwright the script
+re-launches itself into one that has it. Don't go hunting for a venv, and don't
+add `--browser`: driving a browser is already the default.
 
 It prints the report path. **Read that file**, then recommend.
 
@@ -32,11 +36,16 @@ It prints the report path. **Read that file**, then recommend.
   raw/              one JSON per fetch, for tracing a claim back to the source
 ```
 
-- `--browser` is **required for Skroutz** — it is behind Cloudflare and refuses
-  plain HTTP. Without it you get BestPrice only. If `GRPRICE_BROWSER_EXE` is
-  set, the tool starts that browser off-screen and closes it when done;
-  otherwise it falls back to a Playwright-launched one, which Skroutz's bot
-  protection tends to challenge in a loop. Headless never works.
+- **A browser is used automatically** for Skroutz, which is behind Cloudflare
+  and refuses plain HTTP clients. One of the user's own browsers (Brave, Chrome
+  or Edge) is found, started off-screen, and closed when the run ends. Nothing
+  to configure and no flag to pass.
+- `--no-browser` gives a fast BestPrice-only answer. Use it when the user wants
+  a quick price and does not need the whole market — but say that Skroutz was
+  skipped, because the run will be marked incomplete.
+- **If a run comes back `complete: false` with Skroutz missing, do not just
+  report the BestPrice numbers.** Read the warning: if it names Playwright, the
+  fix is one command (it is printed), not a different interpreter.
 - `--plus` — this user has Skroutz Plus. Always pass it (see Shipping below).
 - `--limit N` (default 16) is hits per source, and the only cost dial: **every**
   hit gets a full detail fetch. Measured: the default yields 32 candidates in

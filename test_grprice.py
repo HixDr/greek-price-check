@@ -964,5 +964,51 @@ class BrowserShutdownTests(unittest.TestCase):
         attached.new_browser_cdp_session.assert_not_called()
         attached.close.assert_called_once()
 
+class InterpreterTests(unittest.TestCase):
+    """Playwright lives in a venv; the caller should not have to know which.
+
+    Run with a system python that lacks it and Skroutz silently drops out of
+    the results -- the run reports complete=False and half the market, and the
+    reason is buried in a warning. The script re-launches itself into an
+    interpreter that has it instead.
+    """
+
+    def test_finds_a_venv_that_has_playwright(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            good = root / "good"
+            (good / "lib" / "python3.12" / "site-packages" / "playwright").mkdir(parents=True)
+            (good / "bin").mkdir(parents=True)
+            (good / "bin" / "python").touch(mode=0o755)
+            bare = root / "bare"
+            (bare / "bin").mkdir(parents=True)
+            (bare / "bin" / "python").touch(mode=0o755)
+
+            self.assertIsNone(grprice._python_with_playwright([bare]))
+            self.assertEqual(grprice._python_with_playwright([bare, good]),
+                             str(good / "bin" / "python"))
+
+    def test_ignores_a_venv_without_the_package(self):
+        with TemporaryDirectory() as d:
+            bare = Path(d) / "v"
+            (bare / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+            (bare / "bin").mkdir(parents=True)
+            (bare / "bin" / "python").touch(mode=0o755)
+            self.assertIsNone(grprice._python_with_playwright([bare]))
+
+    def test_candidates_include_the_cache_venv(self):
+        cands = [str(c) for c in grprice._venv_candidates()]
+        self.assertTrue(any("grprice" in c and "venv" in c for c in cands),
+                        f"cache venv not searched: {cands}")
+
+    def test_reexec_does_not_loop(self):
+        """The relaunch must mark itself, or it would re-exec forever."""
+        calls = []
+        with unittest.mock.patch.dict(os.environ, {grprice.REEXEC_FLAG: "1"}), \
+             unittest.mock.patch.object(os, "execv",
+                                        side_effect=lambda *a: calls.append(a)):
+            grprice.ensure_playwright()
+        self.assertEqual(calls, [], "re-exec ran again despite the guard")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
